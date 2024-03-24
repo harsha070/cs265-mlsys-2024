@@ -97,7 +97,9 @@ def graph_transformation(gm: fx.GraphModule, args: Any) -> fx.GraphModule:
 
 
 def experiment():
+    print("starting experiment")
     logging.getLogger().setLevel(logging.DEBUG)
+    logging.debug("experiment begins!")
     torch.manual_seed(20)
     batch_size = 100
     layers = 10
