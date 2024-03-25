@@ -1,5 +1,6 @@
 from enum import Enum
 from typing import Dict
+import time
 import torch
 import torch.fx as fx
 from typing import Dict, Any
@@ -12,6 +13,12 @@ class OP(str, Enum):
     GET_ATTR = "get_attr"
     OUTPUT = "output"
     PLACEHOLDER = "placeholder"
+
+
+class GraphTraversalState(Enum):
+    FORWARD = "forward"
+    LOSS = "loss"
+    BACKWARD = "backward"
 
 
 # This is an example graph_profiler that extends the fx.Interpreter class, it
@@ -61,6 +68,13 @@ class GraphProfiler(fx.Interpreter):
             print ("Node target: ", node.target)
             print ("Input to this node", node.all_input_nodes)
             print ("Users of this node: ", node.users)
+            print ("\n")
+
+        self.graph_state = GraphTraversalState.FORWARD
+        self.stats_time = {}
+        self.stats_memory = {}
+        self.first_use_time = {}
+        self.last_use_time = {}
 
     def run(
         self,
@@ -73,6 +87,17 @@ class GraphProfiler(fx.Interpreter):
         )
 
     def run_node(self, n: fx.Node) -> Any:
+        if n.op == OP.CALL_FUNCTION:
+            breakpoint()
+
+        if n.name == "sep":
+            # Graph state should move from forward to loss computation
+            assert self.graph_state == GraphTraversalState.FORWARD
+            self.graph_state = GraphTraversalState.LOSS
+        elif n.name == "sep_backward":
+            # Graph state should move from loss computation to backward
+            assert self.graph_state == GraphTraversalState.LOSS
+            self.graph_state = GraphTraversalState.BACKWARD
 
         # If you are in the backward pass region and one of the feature maps 'x'
         # was swapped out, and if node 'n' will use this feature map 'x' as one
@@ -80,7 +105,13 @@ class GraphProfiler(fx.Interpreter):
 
 
         # you can start measuring the run-time of a node here
-        result = super().run_node(n)
+        if torch.cuda.is_available():
+            result = super().run_node(n)
+        else:
+            start_time = time.time()
+            result = super().run_node(n)
+            end_time = time.time()
+            self.stats_time[n.name] = end_time - start_time
         # you can end measuring the run-time of a node here
         # HINT: Use torch.cuda.Events for doing time measurements of operations.
 

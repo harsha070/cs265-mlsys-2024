@@ -66,7 +66,7 @@ def train_step(
 
 
 def graph_transformation(gm: fx.GraphModule, args: Any) -> fx.GraphModule:
-    print(gm.graph)
+    # print(gm.graph)
 
     graph_profiler = GraphProfiler(gm)
     with torch.no_grad():
@@ -104,13 +104,24 @@ def experiment():
     batch_size = 100
     layers = 10
     dim = 100
+    layers = 3
+    dim = 16
     num_iters = 5
     dummy_model = DummyModel(dim=dim, layers=layers)
-    model = WrappedDummyModel(dummy_model).cuda()
-    batch = torch.randn(batch_size, dim).cuda()
-    optim = torch.optim.Adam(
-        model.parameters(), lr=0.01, foreach=False, fused=True, capturable=True
-    )
+    if torch.cuda.is_available():
+        model = WrappedDummyModel(dummy_model).cuda()
+        batch = torch.randn(batch_size, dim).cuda()
+    else:
+        model = WrappedDummyModel(dummy_model)
+        batch = torch.randn(batch_size, dim)
+    if torch.cuda.is_available():
+        optim = torch.optim.Adam(
+            model.parameters(), lr=0.01, foreach=False, fused=True, capturable=True
+        )
+    else:
+        optim = torch.optim.Adam(
+            model.parameters(), lr=0.01, foreach=False, fused=False, capturable=True
+        )
 
     compiled_fn = compile(train_step, graph_transformation)
     compiled_fn(model, optim, batch)
