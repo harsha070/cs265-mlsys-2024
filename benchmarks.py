@@ -98,6 +98,14 @@ class Experiment:
             graph_profiler.aggregate_stats()
             graph_profiler.print_stats()
 
+            gm = self.activation_checkpointing(gm, graph_profiler)
+
+        return gm
+    
+    def activation_checkpointing(gm: fx.GraphModule, graph_profiler: GraphProfiler) -> fx.GraphModule:
+        # Select nodes to recompute
+        
+        # Select nodes to checkpoint
         return gm
 
     def run(self):

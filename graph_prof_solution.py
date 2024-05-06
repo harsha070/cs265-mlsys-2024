@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from typing import Dict
 import torch
 import torch.fx as fx
-from typing import Dict, Any, List, cast
+from typing import Dict, Any, List, cast, Set
 import tabulate
 
 # Minimum memory allocated by PyTorch for a tensor, change according to your device type
@@ -61,6 +61,10 @@ class NodeInfo:
     last_forward_uses: List[fx.Node] = field(default_factory=list)
     first_back_uses: List[fx.Node] = field(default_factory=list)
     # You can add more attributes to this class for applying the recomputation algorithm
+    recomp_srcs: Set[fx.Node] = field(default_factory=set)
+    recomp_time: float = 0.0
+    total_recomp_time: float = 0.0
+    recompute_ratio: float = 0.0
 
 
 # This is an example graph_profiler that extends the fx.Interpreter class, it
@@ -361,6 +365,54 @@ class GraphProfiler(fx.Interpreter):
                 val_list.append("")
             node_summaries.append(val_list)
         print(tabulate.tabulate(node_summaries, headers=headers))
+
+    def algorithm_b_recomputation_policy(self, candidate_set: Set[fx.Node], memory_limit: int, max_peak_memory: int) -> Set[fx.Node]:
+        recomp_candidates: Set[fx.Node] = set()
+        memory_consumption = max_peak_memory
+        self.algorithm_d_initialize(candidate_set)
+        while len(candidate_set) > 0:
+            pass
+
+    def algorithm_d_initialize(self, candidate_set: Set[fx.Node]) -> fx.Node:
+        max_candidate: fx.Node = None
+        for candidate in candidate_set:
+            pass
+
+    def algorithm_e_max_candidate(self, candidate_set: Set[fx.Node]) -> fx.Node:
+        max_candidate: fx.Node = None
+        for candidate in candidate_set:
+            if max_candidate is None:
+                max_candidate = candidate
+            else:
+                if self.node_info[max_candidate].recompute_ratio < self.node_info[candidate].recompute_ratio:
+                    max_candidate = candidate
+        return max_candidate
+
+    def algorithm_g_update_recompute_ratio(self, candidate_set: Set[fx.Node]) -> None:
+        for candidate in candidate_set:
+            node_info = self.node_info[candidate]
+            node_info.recompute_ratio = node_info.memory_size / node_info.total_recomp_time
+
+    def algorithm_h_update_existing_recomputations(self, recomps: Set[fx.Node], candidate: fx.Node) -> int:
+        recomp_count = 1
+        for recomp in recomps:
+            if candidate in self.node_info[recomp].recomp_srcs:
+                self.node_info[recomp].recomp_srcs.remove(candidate)
+                self.node_info[recomp].recomp_srcs.update(self.node_info[candidate].recomp_srcs)
+                self.node_info[recomp].recomp_time += self.node_info[candidate].recomp_time
+                recomp_count += 1
+        return recomp_count
+    
+    def algorithm_i_update_candidates(self, t: fx.Node, recomp_count: int, candidates: Set[fx.Node]) -> None:
+        for candidate in candidates:
+            if t in self.node_info[candidate].recomp_srcs:
+                self.node_info[candidate].recomp_srcs.remove(t)
+                self.node_info[candidate].recomp_srcs.add(self.node_info[t].recomp_srcs)
+                self.node_info[candidate].recomp_time += self.node_info[t].recomp_time
+                self.node_info[candidate].total_recomp_time = self.node_info[candidate].recomp_time
+            if candidate in self.node_info[t].recomp_srcs:
+                self.node_info[candidate].total_recomp_time = recomp_count * self.node_info[candidate].recomp_time
+            self.algorithm_g_update_recompute_ratio({candidate})
 
 
 if __name__ == "__main__":
