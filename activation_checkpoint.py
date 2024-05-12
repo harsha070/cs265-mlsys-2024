@@ -135,8 +135,12 @@ if __name__ == "__main__":
     # Obtain the gradients of (w1, w2) using x as input to the traced function
     # NOTE: We have already captured the backward operations during tracing
     # hence we are executing in no grad mode
+    torch.cuda.reset_peak_memory_stats()
+
     with torch.no_grad():
         old_grads = graph_module(w1, w2, x)
+    peak_memory = torch.cuda.max_memory_allocated()
+    print(f'peak memory before: {peak_memory}')
 
     # Apply the activation checkpointing algorithm (check new node 'relu_2')
     new_graph_module = activation_checkpointing(graph_module)
@@ -145,8 +149,11 @@ if __name__ == "__main__":
 
     # Obtain the gradients of (w1, w2) using x as input to the activation
     # checkpointed function to recalculate them
+    torch.cuda.reset_peak_memory_stats()
     with torch.no_grad():
         new_grads = new_graph_module(w1, w2, x)
+    peak_memory = torch.cuda.max_memory_allocated()
+    print(f'peak memory after: {peak_memory}')
 
     # Verify that gradients produced with activation checkpointing equal the
     # ones obtained earlier with no optimization.

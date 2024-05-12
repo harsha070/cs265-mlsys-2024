@@ -5,8 +5,10 @@ from dataclasses import dataclass, field
 from typing import Dict
 import torch
 import torch.fx as fx
-from typing import Dict, Any, List, cast, Set
+from typing import Dict, Any, List, cast, Set, Tuple
 import tabulate
+from torch._functorch.partitioners import _extract_graph_with_inputs_outputs
+import pandas as pd
 
 # Minimum memory allocated by PyTorch for a tensor, change according to your device type
 _PYTORCH_MIN_ALLOCATE = 512
@@ -65,6 +67,7 @@ class NodeInfo:
     recomp_time: float = 0.0
     total_recomp_time: float = 0.0
     recompute_ratio: float = 0.0
+    active_memory: int = 0.0
 
 
 # This is an example graph_profiler that extends the fx.Interpreter class, it
@@ -171,9 +174,9 @@ class GraphProfiler(fx.Interpreter):
                     self.node_info[first_backward].first_back_uses.append(node)
                     n_info.first_back_access = first_backward
                     n_info.last_forward_access = last_forward
-                    print(
-                        f"Intermediate Node: {node.name}, Last forward use: {last_forward.name}, First backward use: {first_backward.name}"
-                    )
+                    # print(
+                    #     f"Intermediate Node: {node.name}, Last forward use: {last_forward.name}, First backward use: {first_backward.name}"
+                    # )
 
     def _swap_out_node(self, node: fx.Node) -> None:
         # 1) Get the nodes to be offloaded
@@ -302,6 +305,7 @@ class GraphProfiler(fx.Interpreter):
         self.node_runtimes.setdefault(node, []).append(run_time)
         n_info.mem_stats = self.get_total_memory_breakdown()
         n_info.peak_total_mem = active_memory + self.swapped_memory
+        n_info.active_memory = active_memory
 
         # Alternate way to measure the memory of the resultant tensor
 
@@ -337,7 +341,7 @@ class GraphProfiler(fx.Interpreter):
         self.node_runtimes.clear()
         self.node_swap_times.clear()
 
-    def print_stats(self):
+    def print_stats(self, save_path=None):
         headers: List[str] = [
             "Node",
             "Target",
@@ -345,8 +349,15 @@ class GraphProfiler(fx.Interpreter):
             "Avg runtime (ms)",
             "Peak Memory (B)",
             "Swap Time (ms)",
+            "Rank",
+            "Param Opt State Memory",
+            "Gradient Memory",
+            "Activation Memory",
+            "Other Memory",
+            "Active Memory",
         ]
         node_summaries: List[List[Any]] = []
+        node_summaries_data = []
 
         for node in self.module.graph.nodes:
             if node.op == OP.PLACEHOLDER:
@@ -360,23 +371,70 @@ class GraphProfiler(fx.Interpreter):
                 n_info.peak_total_mem,
             ]
             if node in self.intermediate_nodes:
-                val_list.append(n_info.swap_time)
+                val_list.append(str(n_info.swap_time))
             else:
                 val_list.append("")
             node_summaries.append(val_list)
-        print(tabulate.tabulate(node_summaries, headers=headers))
+            val_list.extend([
+                n_info.rank,
+                n_info.mem_stats.param_and_opt_state_memory,
+                n_info.mem_stats.grad_memory,
+                n_info.mem_stats.activation_memory,
+                n_info.mem_stats.other_memory,
+                n_info.active_memory,
+            ])
+            node_summaries_data.append(dict(zip(headers, val_list)))
+        if save_path is not None:
+            node_summaries_data = pd.DataFrame(node_summaries_data)
+            node_summaries_data.to_parquet(save_path)
+        else:
+            print(tabulate.tabulate(node_summaries, headers=headers))
 
-    def algorithm_b_recomputation_policy(self, candidate_set: Set[fx.Node], memory_limit: int, max_peak_memory: int) -> Set[fx.Node]:
-        recomp_candidates: Set[fx.Node] = set()
+    def get_peak_memory(self) -> int:
+        peak_memory = 0.0
+        for node in self.module.graph.nodes:
+            if node.op == OP.PLACEHOLDER:
+                continue
+            n_info = self.node_info[node]
+            peak_memory = max(n_info.peak_total_mem, peak_memory)
+        return peak_memory
+
+    def algorithm_b_recomputation_policy(self, candidate_set: Set[fx.Node], memory_limit: int, max_peak_memory: int) -> Tuple[Set[fx.Node], Set[fx.Node]]:
+        recomps: Set[fx.Node] = set()
         memory_consumption = max_peak_memory
         self.algorithm_d_initialize(candidate_set)
         while len(candidate_set) > 0:
-            pass
+            r_cand = self.algorithm_e_max_candidate(candidate_set=candidate_set)
+            recomps.add(r_cand)
+            cand = r_cand
+            candidate_set.remove(cand)
+            recomp_count = self.algorithm_h_update_existing_recomputations(recomps=recomps, candidate=cand)
+            self.algorithm_i_update_candidates(t=cand, recomp_count=recomp_count, candidates=candidate_set, recomps=recomps)
+            memory_consumption -= self.node_info[cand].memory_size
+            # print(f"recomputing node: {cand}. memory consumption down to: {memory_consumption}")
+            if (memory_consumption - memory_limit) <= 0:
+              break
+        return candidate_set, recomps
 
     def algorithm_d_initialize(self, candidate_set: Set[fx.Node]) -> fx.Node:
-        max_candidate: fx.Node = None
+
+        def get_srcs(cand):
+            srcs = []
+            for node in cand.all_input_nodes:
+              if node.op == "placeholder":
+                srcs.append(node)
+              elif node in candidate_set:
+                srcs.append(node)
+              else:
+                srcs.extend(get_srcs(node))
+            return srcs
+
         for candidate in candidate_set:
-            pass
+            node_info = self.node_info[candidate]
+            node_info.recomp_srcs = set(get_srcs(candidate))
+            node_info.recomp_time = node_info.run_time
+            node_info.total_recomp_time = node_info.recomp_time
+            node_info.recompute_ratio = node_info.memory_size / node_info.total_recomp_time
 
     def algorithm_e_max_candidate(self, candidate_set: Set[fx.Node]) -> fx.Node:
         max_candidate: fx.Node = None
@@ -396,24 +454,28 @@ class GraphProfiler(fx.Interpreter):
     def algorithm_h_update_existing_recomputations(self, recomps: Set[fx.Node], candidate: fx.Node) -> int:
         recomp_count = 1
         for recomp in recomps:
-            if candidate in self.node_info[recomp].recomp_srcs:
-                self.node_info[recomp].recomp_srcs.remove(candidate)
-                self.node_info[recomp].recomp_srcs.update(self.node_info[candidate].recomp_srcs)
-                self.node_info[recomp].recomp_time += self.node_info[candidate].recomp_time
+            recomp_node_info = self.node_info[recomp]
+            if candidate in recomp_node_info.recomp_srcs:
+                recomp_node_info.recomp_srcs.remove(candidate)
+                recomp_node_info.recomp_srcs.update(self.node_info[candidate].recomp_srcs)
+                recomp_node_info.recomp_time += self.node_info[candidate].recomp_time
                 recomp_count += 1
         return recomp_count
-    
-    def algorithm_i_update_candidates(self, t: fx.Node, recomp_count: int, candidates: Set[fx.Node]) -> None:
+
+    def algorithm_i_update_candidates(self, t: fx.Node, recomp_count: int, candidates: Set[fx.Node], recomps: Set[fx.Node]) -> None:
         for candidate in candidates:
-            if t in self.node_info[candidate].recomp_srcs:
-                self.node_info[candidate].recomp_srcs.remove(t)
-                self.node_info[candidate].recomp_srcs.add(self.node_info[t].recomp_srcs)
-                self.node_info[candidate].recomp_time += self.node_info[t].recomp_time
-                self.node_info[candidate].total_recomp_time = self.node_info[candidate].recomp_time
+            node_info = self.node_info[candidate]
+            if t in node_info.recomp_srcs:
+                node_info.recomp_srcs.remove(t)
+                node_info.recomp_srcs.update(self.node_info[t].recomp_srcs)
+                node_info.recomp_time += self.node_info[t].recomp_time
+                node_info.total_recomp_time = node_info.recomp_time
+                for rp in recomps:
+                    if candidate in self.node_info[rp].recomp_srcs:
+                        node_info.total_recomp_time += node_info.recomp_time
             if candidate in self.node_info[t].recomp_srcs:
                 self.node_info[candidate].total_recomp_time = recomp_count * self.node_info[candidate].recomp_time
             self.algorithm_g_update_recompute_ratio({candidate})
-
 
 if __name__ == "__main__":
     print("Executing this file")
